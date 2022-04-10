@@ -60,3 +60,66 @@ get_default_task如函数所示，	如果未定义ASIO_HAS_IO_URING_AS_DEFAULT�
 	#else
 		typedef select_reactor reactor;
 	#endif
+### asio::ip::tcp::acceptor
+我们拿tcp来分析下scheduler的reactor。
+
+    asio::io_context ioc;
+    asio::ip::tcp::acceptor acceptor(ioc, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), 8000));
+    acceptor.async_accept([](std::error_code ec, asio::ip::tcp::socket s){});
+    ioc.run();
+acceptor的构造函数：
+
+	template <typename ExecutionContext>
+		basic_socket_acceptor(ExecutionContext& context,
+      	const endpoint_type& endpoint, bool reuse_addr = true,
+      	typename constraint<
+        	is_convertible<ExecutionContext&, execution_context&>::value
+      	>::type = 0)
+    : impl_(0, 0, context)
+	{
+		...
+	}
+impl_是关键，可见在不同平台下，impl_是选择相应的实现
+
+	#if defined(ASIO_WINDOWS_RUNTIME)
+	detail::io_object_impl<
+    	detail::null_socket_service<Protocol>, Executor> impl_;
+	#elif defined(ASIO_HAS_IOCP)
+		detail::io_object_impl<
+    		detail::win_iocp_socket_service<Protocol>, Executor> impl_;
+	#elif defined(ASIO_HAS_IO_URING_AS_DEFAULT)
+		detail::io_object_impl<
+    		detail::io_uring_socket_service<Protocol>, Executor> impl_;
+	#else
+		detail::io_object_impl<
+    		detail::reactive_socket_service<Protocol>, Executor> impl_;
+	#endif
+在linux下是最后的，即detail::reactive_socket_service
+
+	(gdb) ptype impl_
+	type = class asio::detail::io_object_impl<asio::detail::reactive_socket_service<asio::ip::tcp>, asio::any_io_executor>
+reactive_socket_service继承自reactive_socket_service_base，而它有个reactor_成员，
+
+	// The selector that performs event demultiplexing for the service.
+	reactor& reactor_;
+reactive_socket_service_base的构造函数：
+
+	reactive_socket_service_base::reactive_socket_service_base(
+		execution_context& context)
+	: reactor_(use_service<reactor>(context))
+	{
+		reactor_.init_task();
+	}
+此时查看reactor_的类型，就是epoll_reactor
+
+	(gdb) ptype reactor_
+	type = class asio::detail::epoll_reactor
+在use_service的函数调用中，进行了epoll_reactor类的创建，在init_task中，就调用了scheduler的init_task函数，初始化task_和task_operation_并push了一个task_operation_到任务队列op_queue_中。由于task_interrupted_一开始创建的时候就是true，所以此时并不会执行这个task_operation_。并且没有调用work_started，outstanding_work_也是0，所以此时执行run，依旧会退出。
+
+当acceptor提供了回调函数的时候，此时run就会进入阻塞，并一直运行下去，我们来分析下为什么：
+
+	acceptor.async_accept([](std::error_code ec, asio::ip::tcp::socket s){});
+
+
+
+
