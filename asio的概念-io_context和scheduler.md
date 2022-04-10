@@ -245,6 +245,48 @@ schedule_task的run函数：
 很明显，reactor或io_uring_service就是这种scheduler_task
 ##### op_queue<operation> op_queue_
 任务队列
+## io_context一直run下去
+当对io_context没有做额外处理的时候，在执行完task后，run就会退出，这是因为下面这段代码
+
+	work_cleanup on_exit = { this, &lock, &this_thread };
+    (void)on_exit;
+work_cleanup的析构函数有这样一段
+
+	else if (this_thread_->private_outstanding_work < 1)
+    {
+      scheduler_->work_finished();
+    }
+因为在run的函数中，private_outstanding_work赋值是0，所以会执行scheduler_->work_finished();
+
+	void work_finished()
+	{
+    	if (--outstanding_work_ == 0)
+      		stop();
+	}
+所以显然要让run一直运行下去，就需要让outstanding_work始终大于0，这样do_run_one就会进入wait状态，因为stopped_一直都是false
+
+	while (!stopped_)
+	{
+		...
+		wakeup_event_.wait(lock);
+	}
+### asio::io_context::work
+这个类做的事很简单，就是让io_context的scheduler的outstanding_work_初始值为1，又没有pushtask，所以一直会进入wait状态
+
+	inline io_context::work::work(asio::io_context& io_context)
+		: io_context_impl_(io_context.impl_)
+	{
+		io_context_impl_.work_started();
+	}
+	void work_started()
+	{
+    	++outstanding_work_;
+	}
+所以要让一个io_context一直运行下去，需要work包装下：
+	
+	asio::io_context ioc;
+	asio::io_context::work work(ioc);
+	ioc.run();
 
 
 
