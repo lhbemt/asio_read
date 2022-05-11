@@ -18,6 +18,8 @@ asio使用的就是这个模型，即数据真正完成了读写后才通知。�
 Proactor 是异步网络模式， 感知的是已完成的读写事件。在发起异步读写请求时，需要传入数据缓冲区的地址（用来存放结果数据）等信息，这样系统内核才可以自动帮我们把数据的读写工作完成，这里的读写工作全程由操作系统来做，并不需要像 Reactor 那样还需要应用进程主动发起 read/write 来读写数据，操作系统完成读写工作后，就会通知应用进程直接处理数据。
 ## scheduler下使用的模型
 遗憾的是，linux下的异步I/O支持不完善，aio系列函数是在用户空间下模拟出来的异步，而不是真正的操作系统级别的支持，并且还只支持本地文件的aio异步操作，网络socket行不通。。所以在linux下的高性能的网络库使用的是reactor模型，而不是proactor，在windows下则是可以使用这个效率更高的proactor模型。
+## scheduler与reactor
+在iocontext和scheduler那文中，我们知道scheduler其实就是多个线程从任务队列中取任务来执行的过程，当任务都被取完了，则运行完毕，会退出run函数，那么scheduler与reactor怎么绑定起来的呢，我们发现在scheduler的构造函数中，有个get_task_函数指针，该函数默认的就是scheduler的get_default_task函数。
 ### scheduler的get_default_task函数
 get_default_task如函数所示，	如果未定义ASIO_HAS_IO_URING_AS_DEFAULT宏，将返回reactor的实例
 
@@ -60,6 +62,16 @@ get_default_task如函数所示，	如果未定义ASIO_HAS_IO_URING_AS_DEFAULT�
 	#else
 		typedef select_reactor reactor;
 	#endif
+因此在linux的平台下将会选择epoll_reactor。
+因为scheduler的构造函数，就已经创建一个一个owner线程，它此时在等待被唤醒，而一旦被唤醒，执行的是scheduler的run函数。
+
+	if (own_thread)
+	{
+    	++outstanding_work_;
+    	asio::detail::signal_blocker sb;
+    	thread_ = new asio::detail::thread(thread_function(this));
+	}
+thread_function(this)执行的就是this->run()，所以是scheduler的run函数，默认的own_thread是false。
 ### asio::ip::tcp::acceptor
 我们拿tcp来分析下scheduler的reactor。
 
@@ -70,15 +82,37 @@ get_default_task如函数所示，	如果未定义ASIO_HAS_IO_URING_AS_DEFAULT�
 acceptor的构造函数：
 
 	template <typename ExecutionContext>
-		basic_socket_acceptor(ExecutionContext& context,
-      	const endpoint_type& endpoint, bool reuse_addr = true,
-      	typename constraint<
-        	is_convertible<ExecutionContext&, execution_context&>::value
-      	>::type = 0)
+	basic_socket_acceptor(ExecutionContext& context,
+      const endpoint_type& endpoint, bool reuse_addr = true,
+      typename constraint<
+        is_convertible<ExecutionContext&, execution_context&>::value
+      >::type = 0)
     : impl_(0, 0, context)
 	{
-		...
+    	asio::error_code ec;
+    	const protocol_type protocol = endpoint.protocol();
+    	impl_.get_service().open(impl_.get_implementation(), protocol, ec);
+    	asio::detail::throw_error(ec, "open");
+    	if (reuse_addr)
+    	{
+      		impl_.get_service().set_option(impl_.get_implementation(),
+          		socket_base::reuse_address(true), ec);
+      		asio::detail::throw_error(ec, "set_option");
+    	}
+    	impl_.get_service().bind(impl_.get_implementation(), endpoint, ec);
+    	asio::detail::throw_error(ec, "bind");
+    	impl_.get_service().listen(impl_.get_implementation(),
+        socket_base::max_listen_connections, ec);
+    	asio::detail::throw_error(ec, "listen");
 	}
+其中open显然就是创建一个协议相关的socket了，然后可以对这个socket进行设置，上面的set_option是socket设置，比如常见的reuseaddr，接着是常规的绑定监听了。绑定监听后，就可以accept开始接收客户端的连接了。显然，impl_.get_service()返回的就是socket相关的封装类，可以对这个socket进行bind和listen。
+#### 重要的listen参数
+max_listen_connections是listen的队列值，这个值一定要设置成很大，不然你accept很容易被打满，从而许多连接被丢弃，之前我吃过亏，可以看到asio里的：
+
+	  ASIO_STATIC_CONSTANT(int, max_listen_connections
+      = ASIO_OS_DEF(SOMAXCONN));
+这个SOMAXCONN非常大，是0x7fffffff，我们自己写的时候，也应该定义成最大。
+#### impl_
 impl_是关键，可见在不同平台下，impl_是选择相应的实现
 
 	#if defined(ASIO_WINDOWS_RUNTIME)
@@ -98,7 +132,7 @@ impl_是关键，可见在不同平台下，impl_是选择相应的实现
 
 	(gdb) ptype impl_
 	type = class asio::detail::io_object_impl<asio::detail::reactive_socket_service<asio::ip::tcp>, asio::any_io_executor>
-reactive_socket_service继承自reactive_socket_service_base，而它有个reactor_成员，
+可见impl_是一个io_object_impl，而每个io_object_impl有个service来提供数据，就是其模板的第一个参数，而acceptor的service就是reactive_socket_service，它继承自reactive_socket_service_base，而它有个reactor_成员，
 
 	// The selector that performs event demultiplexing for the service.
 	reactor& reactor_;
@@ -114,12 +148,190 @@ reactive_socket_service_base的构造函数：
 
 	(gdb) ptype reactor_
 	type = class asio::detail::epoll_reactor
-在use_service的函数调用中，进行了epoll_reactor类的创建，在init_task中，就调用了scheduler的init_task函数，初始化task_和task_operation_并push了一个task_operation_到任务队列op_queue_中。由于task_interrupted_一开始创建的时候就是true，所以此时并不会执行这个task_operation_。并且没有调用work_started，outstanding_work_也是0，所以此时执行run，依旧会退出。
-
+在use_service的函数调用中，进行了epoll_reactor类的创建，在init_task中，就调用了scheduler的init_task函数，初始化task_和task_operation_并push了一个task_operation_到任务队列op_queue_中。由于own_thread是false，task_interrupted_一开始创建的时候就是true，并且没有调用work_started，outstanding_work_也是0，所以此时执行run，依旧会退出。
+#### async_accept
 当acceptor提供了回调函数的时候，此时run就会进入阻塞，并一直运行下去，我们来分析下为什么：
 
 	acceptor.async_accept([](std::error_code ec, asio::ip::tcp::socket s){});
+在这个函数内部，有这部分代码：
+	
+	template <
+    ASIO_COMPLETION_TOKEN_FOR(void (asio::error_code,
+       typename Protocol::socket::template rebind_executor<
+         executor_type>::other)) MoveAcceptToken
+          ASIO_DEFAULT_COMPLETION_TOKEN_TYPE(executor_type)>
+	ASIO_INITFN_AUTO_RESULT_TYPE(MoveAcceptToken,
+      void (asio::error_code,
+        typename Protocol::socket::template
+          rebind_executor<executor_type>::other))
+	async_accept(
+      ASIO_MOVE_ARG(MoveAcceptToken) token
+        ASIO_DEFAULT_COMPLETION_TOKEN(executor_type))
+	{
+    	return async_initiate<MoveAcceptToken,
+      		void (asio::error_code, typename Protocol::socket::template
+        	rebind_executor<executor_type>::other)>(
+          	initiate_async_move_accept(this), token,
+          	impl_.get_executor(), static_cast<endpoint_type*>(0),
+          	static_cast<typename Protocol::socket::template
+            rebind_executor<executor_type>::other*>(0));
+	}
+最后走到的是self_->impl_.get_service().async_move_accept函数里，
 
+	template <typename MoveAcceptHandler, typename Executor1, typename Socket>
+    void operator()(ASIO_MOVE_ARG(MoveAcceptHandler) handler,
+        const Executor1& peer_ex, endpoint_type* peer_endpoint, Socket*) const
+    {
+      // If you get an error on the following line it means that your handler
+      // does not meet the documented type requirements for a MoveAcceptHandler.
+      ASIO_MOVE_ACCEPT_HANDLER_CHECK(
+          MoveAcceptHandler, handler, Socket) type_check;
+      detail::non_const_lvalue<MoveAcceptHandler> handler2(handler);
+      self_->impl_.get_service().async_move_accept(
+          self_->impl_.get_implementation(), peer_ex, peer_endpoint,
+          handler2.value, self_->impl_.get_executor());
+    }
+而通过上面我们知道self_->impl_.get_service()是reactive_socket_service，它有个reactor_，在linux就是epoll_reactor，不出意料的话是进入epoll_wait。在async_move_accept函数中，定义了一个op操作：
+
+	typedef reactive_socket_move_accept_op<Protocol,PeerIoExecutor, Handler, IoExecutor> op;
+    typename op::ptr p = { asio::detail::addressof(handler),
+      op::ptr::allocate(handler), 0 };
+    p.p = new (p.v) op(success_ec_, peer_io_ex, impl.socket_,
+        impl.state_, impl.protocol_, peer_endpoint, handler, io_ex);
+将其初始化后，进入开始accept阶段
+
+	start_accept_op(impl, p.p, is_continuation, false);
+而在accept函数中，
+
+	void reactive_socket_service_base::start_accept_op(
+    	reactive_socket_service_base::base_implementation_type& impl,
+    	reactor_op* op, bool is_continuation, bool peer_is_open)
+	{
+		if (!peer_is_open)
+			start_op(impl, reactor::read_op, op, is_continuation, true, false);
+		else
+		{
+    		op->ec_ = asio::error::already_open;
+    		reactor_.post_immediate_completion(op, is_continuation);
+		}	
+	}
+可以看到，当peer_is_open为false的时候，就start_op，而当peer_is_open为true的时候，则使用post_immediate_completion向sheduler投递任务，op就是reactor_op的定义。上面传入的是false，所以调用的是start_op，有个参数是reactor::read_op，而reactor定义了这些op:
+
+	enum op_types { read_op = 0, write_op = 1,
+    	connect_op = 1, except_op = 2, max_ops = 3 };
+我们都知道accept成功后表示数据可读，所以它是read_op，
+	
+	void reactive_socket_service_base::start_op(
+    reactive_socket_service_base::base_implementation_type& impl,
+    int op_type, reactor_op* op, bool is_continuation,
+    bool is_non_blocking, bool noop)
+	{
+		if (!noop)
+		{
+    		if ((impl.state_ & socket_ops::non_blocking)
+        		|| socket_ops::set_internal_non_blocking(
+          		impl.socket_, impl.state_, true, op->ec_))
+    		{
+      			reactor_.start_op(op_type, impl.socket_,
+          			impl.reactor_data_, op, is_continuation, is_non_blocking);
+      			return;
+    		}
+		}
+		reactor_.post_immediate_completion(op, is_continuation);
+	}
+noop为false表示有op，所以会走reactor_.start_op即epoll_reactor的start_op。
+这个函数相当长，在epoll_reactor.ipp的第232行。我们这里只看下它的行为，上面的impl.reactor_data_是epoll_reactor::per_descriptor_data类型，
+
+	class descriptor_state : operation
+	{
+    	friend class epoll_reactor;
+    	friend class object_pool_access;
+    	descriptor_state* next_;
+    	descriptor_state* prev_;
+    	mutex mutex_;
+    	epoll_reactor* reactor_;
+    	int descriptor_;
+    	uint32_t registered_events_;
+    	op_queue<reactor_op> op_queue_[max_ops];
+    	bool try_speculative_[max_ops];
+    	bool shutdown_;
+    	ASIO_DECL descriptor_state(bool locking);
+    	void set_ready_events(uint32_t events) { task_result_ = events; }
+    	void add_ready_events(uint32_t events) { task_result_ |= events; }
+    	ASIO_DECL operation* perform_io(uint32_t events);
+    	ASIO_DECL static void do_complete(
+        	void* owner, operation* base,
+        	const asio::error_code& ec, std::size_t bytes_transferred);
+	};
+这个描述符有mutex锁，而start_op也确实会先上锁，因为每个reactive_socket_service是会有一个reactor_data_，上面的op_queue是一个操作完成的队列，它是个数组，因为有多种操作，如read，write。表示当前的操作队列，最典型的就是当发送数据时，如果write此时繁忙，就需要设置epollout事件，这个函数也确实这么做了：
+
+      if (op_type == write_op)
+      {
+        if ((descriptor_data->registered_events_ & EPOLLOUT) == 0)
+        {
+          epoll_event ev = { 0, { 0 } };
+          ev.events = descriptor_data->registered_events_ | EPOLLOUT;
+          ev.data.ptr = descriptor_data;
+          if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, descriptor, &ev) == 0)
+          {
+            descriptor_data->registered_events_ |= ev.events;
+          }
+          else
+          {
+            op->ec_ = asio::error_code(errno,
+                asio::error::get_system_category());
+            scheduler_.post_immediate_completion(op, is_continuation);
+            return;
+          }
+        }
+      }
+最后执行
+
+	descriptor_data->op_queue_[op_type].push(op);
+	scheduler_.work_started();
+可以看到调用了work_started，所以outstanding_work就为1了，所以在run的时候，就会do_run_one，会运行default_task，即下面这段：
+
+      if (o == &task_operation_)
+      {
+        task_interrupted_ = more_handlers;
+        if (more_handlers && !one_thread_)
+          wakeup_event_.unlock_and_signal_one(lock);
+        else
+          lock.unlock();
+        task_cleanup on_exit = { this, &lock, &this_thread };
+        (void)on_exit;
+        // Run the task. May throw an exception. Only block if the operation
+        // queue is empty and we're not polling, otherwise we want to return
+        // as soon as possible.
+        task_->run(more_handlers ? 0 : -1, this_thread.private_op_queue);
+      }
+task_->run进入的就是epoll_reactor的run函数了。
+
+	void epoll_reactor::run(long usec, op_queue<operation>& ops)
+	{
+	// This code relies on the fact that the scheduler queues the reactor task
+	// behind all descriptor operations generated by this function. This means,
+	// that by the time we reach this point, any previously returned descriptor
+	// operations have already been dequeued. Therefore it is now safe for us to
+	// reuse and return them for the scheduler to queue again.
+	// Calculate timeout. Check the timer queues only if timerfd is not in use.
+	int timeout;
+	if (usec == 0)
+    	timeout = 0;
+	else
+	{
+    	timeout = (usec < 0) ? -1 : ((usec - 1) / 1000 + 1);
+    	if (timer_fd_ == -1)
+    	{
+      		mutex::scoped_lock lock(mutex_);
+      		timeout = get_timeout(timeout);
+    	}
+	}
+	// Block on the epoll descriptor.
+	epoll_event events[128];
+	int num_events = epoll_wait(epoll_fd_, events, 128, timeout);
+可以看到，此时进入了epoll_wait，从而进入等待事件的状态。
+### epoll_reactor的具体分析，我们留到下一章节。从info threads来看，只有一个主线程在跑，所以它的reactor模型是单线程的reactor模型。
 
 
 

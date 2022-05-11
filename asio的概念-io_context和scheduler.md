@@ -287,10 +287,14 @@ work_cleanup的析构函数有这样一段
 	asio::io_context ioc;
 	asio::io_context::work work(ioc);
 	ioc.run();
+### 多个线程启动io_context
+在默认的io_context是单线程的且不会启动own_thread，即没有默认的任务执行
 
-
-
-
-
+	io_context::io_context(int concurrency_hint)
+	: impl_(add_impl(new impl_type(*this, concurrency_hint == 1
+          ? ASIO_CONCURRENCY_HINT_1 : concurrency_hint, false)))
+	{
+	}
+当传入多个线程去启动io_context的时候，显然，也是交给了scheduler。然而，asio对io_context的这个concurrency_hint看起来是无效的，无论我设置多少个线程，gdb先的info threads，都是只有一个线程。。这让我很困惑。。看起来这个多线程在iocontext里并没有实现，它不是多线程去队列拿任务，很奇怪。。
 
 
